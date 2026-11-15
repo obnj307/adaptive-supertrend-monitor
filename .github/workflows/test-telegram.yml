@@ -1,4 +1,3 @@
-
 name: Test Telegram Connection
 
 on:
@@ -47,4 +46,3 @@ jobs:
               print(f"Telegram HTTP {error.code}: {description}")
               raise SystemExit(1)
           PY
-
