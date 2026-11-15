@@ -24,7 +24,7 @@ jobs:
           url = f"https://api.telegram.org/bot{token}/sendMessage"
           data = json.dumps({
               "chat_id": chat_id,
-              "text": "✅ Adaptive SuperTrend: Telegram-Verbindung erfolgreich!"
+              "text": "Adaptive SuperTrend: Telegram-Verbindung erfolgreich!"
           }).encode("utf-8")
 
           request = urllib.request.Request(
