@@ -1,1 +1,50 @@
 
+name: Test Telegram Connection
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Telegram test
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import json
+          import urllib.request
+          import urllib.error
+
+          token = os.environ["TELEGRAM_BOT_TOKEN"]
+          chat_id = os.environ["TELEGRAM_CHAT_ID"]
+
+          url = f"https://api.telegram.org/bot{token}/sendMessage"
+          data = json.dumps({
+              "chat_id": chat_id,
+              "text": "✅ Adaptive SuperTrend: Telegram-Verbindung erfolgreich!"
+          }).encode("utf-8")
+
+          request = urllib.request.Request(
+              url,
+              data=data,
+              headers={"Content-Type": "application/json"}
+          )
+
+          try:
+              with urllib.request.urlopen(request, timeout=20) as response:
+                  result = json.load(response)
+                  print("Telegram-Verbindung erfolgreich:", result.get("ok"))
+          except urllib.error.HTTPError as error:
+              body = error.read().decode("utf-8", errors="replace")
+              try:
+                  description = json.loads(body).get("description", "Unbekannt")
+              except ValueError:
+                  description = "Antwort konnte nicht gelesen werden"
+              print(f"Telegram HTTP {error.code}: {description}")
+              raise SystemExit(1)
+          PY
+
