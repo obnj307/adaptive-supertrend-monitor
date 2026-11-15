@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bitget USDT perpetual multi-market adaptive SuperTrend M5 signal monitor."""
+"""Bitget USDT perpetual M5 monitor: Adaptive SuperTrend + Range Filter."""
 import json
 import logging
 import math
@@ -20,6 +20,8 @@ FACTOR = 3.0
 TOP_N = 50
 MIN_TURNOVER_USDT = 10_000_000
 PINNED = ('BTCUSDT', 'ETHUSDT', 'ADAUSDT', 'DOTUSDT')
+RANGE_PERIOD = 100
+RANGE_MULTIPLIER = 3.0
 STATE_FILE = Path('state/last_processed.json')
 LOG = logging.getLogger('supertrend')
 
@@ -159,20 +161,88 @@ def compute(candles):
     return output
 
 
-def send_telegram(symbol, record):
+def ema_step(previous, value, length):
+    """Pine ta.ema recurrence; initialize from first non-na sample."""
+    if previous is None:
+        return value
+    alpha = 2.0 / (length + 1.0)
+    return alpha * value + (1.0 - alpha) * previous
+
+
+def compute_range_filter(candles):
+    """Port of Range Filter Buy and Sell 5min, close/per=100/mult=3.
+
+    Uses the available 200-candle Bitget window. EMA(199) warm-up may
+    differ from TradingView, which usually has much longer history.
+    """
+    result = []
+    prev_close = None
+    avg_change = None
+    smoothed_range = None
+    prev_filter = None
+    upward = 0
+    downward = 0
+    previous_condition = 0
+
+    for candle in candles:
+        close = candle['close']
+        if prev_close is None:
+            # ta.ema(abs(src-src[1])) is na on the first bar.
+            filtered = close
+            result.append({'time': candle['time'], 'close': close,
+                           'filter': filtered, 'range': None, 'signal': None})
+            prev_filter = filtered
+            prev_close = close
+            continue
+
+        avg_change = ema_step(avg_change, abs(close - prev_close), RANGE_PERIOD)
+        smoothed_range = ema_step(smoothed_range, avg_change, RANGE_PERIOD * 2 - 1)
+        rng = smoothed_range * RANGE_MULTIPLIER
+
+        # Pine rngfilt(): move only when price crosses the previous filter +/- range.
+        if close > prev_filter:
+            filtered = max(prev_filter, close - rng)
+        else:
+            filtered = min(prev_filter, close + rng)
+
+        if filtered > prev_filter:
+            upward += 1
+            downward = 0
+        elif filtered < prev_filter:
+            downward += 1
+            upward = 0
+
+        # The original Pine OR conditions reduce to these two expressions.
+        long_cond = close > filtered and upward > 0
+        short_cond = close < filtered and downward > 0
+        condition = 1 if long_cond else -1 if short_cond else previous_condition
+        signal = ('BUY' if long_cond and previous_condition == -1 else
+                  'SELL' if short_cond and previous_condition == 1 else None)
+        result.append({'time': candle['time'], 'close': close,
+                       'filter': filtered, 'range': rng, 'signal': signal})
+        previous_condition = condition
+        prev_filter = filtered
+        prev_close = close
+    return result
+
+
+def send_telegram(symbol, record, indicator):
     token, chat_id = os.environ.get('TELEGRAM_BOT_TOKEN'), os.environ.get('TELEGRAM_CHAT_ID')
     if not token or not chat_id:
         raise RuntimeError('Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID')
     closed = datetime.fromtimestamp((record['time'] + INTERVAL_MS) / 1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
     emoji = '🟢' if record['signal'] == 'BUY' else '🔴'
-    volatility = ('HIGH', 'MEDIUM', 'LOW')[record['cluster']]
     message = (f'{emoji} {record["signal"]} – {symbol}.P (Bitget)\n'
-               f'Adaptive SuperTrend · M5\n'
+               f'{indicator} · M5\n'
                f'Kerzenschluss: {closed}\n'
-               f'Schlusskurs: {record["close"]:.8g} USDT\n'
-               f'SuperTrend: {record["st"]:.8g}\n'
-               f'Volatilität: {volatility}\n'
-               f'Nur Signal – keine Order')
+               f'Schlusskurs: {record["close"]:.8g} USDT\n')
+    if indicator == 'Adaptive SuperTrend':
+        volatility = ('HIGH', 'MEDIUM', 'LOW')[record['cluster']]
+        message += (f'SuperTrend: {record["st"]:.8g}\n'
+                    f'Volatilität: {volatility}\n')
+    else:
+        message += f'Range Filter: {record["filter"]:.8g}\n'
+    message += 'Nur Signal – keine Order'
     response = get_json(f'https://api.telegram.org/bot{token}/sendMessage',
                         headers={'Content-Type': 'application/x-www-form-urlencoded'},
                         data=urlencode({'chat_id': chat_id, 'text': message}).encode())
@@ -187,43 +257,69 @@ def save_state(state):
     temp.replace(STATE_FILE)
 
 
+def process_indicator(symbol, records, checkpoints, indicator, state):
+    if len(records) < 2:
+        raise RuntimeError(f'{indicator}: insufficient computed records')
+    latest = records[-1]
+    previous = checkpoints.get(symbol)
+    LOG.info('%s %s candle=%s signal=%s', symbol, indicator,
+             latest['time'], latest['signal'])
+    if previous is None:
+        LOG.info('%s %s first observation; no historical alerts', symbol, indicator)
+    else:
+        previous = int(previous)
+        if previous > latest['time']:
+            raise RuntimeError(f'{indicator}: checkpoint newer than exchange candle')
+        if previous < records[0]['time']:
+            raise RuntimeError(f'{indicator}: checkpoint older than available history')
+        for record in records:
+            if record['time'] > previous and record['signal']:
+                send_telegram(symbol, record, indicator)
+                LOG.info('%s %s Telegram %s sent for %s', symbol, indicator,
+                         record['signal'], record['time'])
+    checkpoints[symbol] = latest['time']
+    save_state(state)
+
+
 def main():
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     state = json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
     if not isinstance(state, dict):
         raise RuntimeError('Invalid state JSON')
-    # Preserve BTC checkpoint when upgrading from V1.
+
+    # Migrate V1/V2 state without losing SuperTrend checkpoints.
     if 'last_processed_open_ms' in state:
-        state = {'symbols': {'BTCUSDT': int(state['last_processed_open_ms'])}}
-    checkpoints = state.setdefault('symbols', {})
+        old_symbols = {'BTCUSDT': int(state['last_processed_open_ms'])}
+        state = {'supertrend': old_symbols, 'range_filter': {}}
+    elif 'symbols' in state:
+        state = {'supertrend': state['symbols'], 'range_filter': {}}
+    st_checkpoints = state.setdefault('supertrend', {})
+    rf_checkpoints = state.setdefault('range_filter', {})
+    if not isinstance(st_checkpoints, dict) or not isinstance(rf_checkpoints, dict):
+        raise RuntimeError('Invalid indicator checkpoints')
+
     symbols = select_symbols()
     errors = []
     for symbol in symbols:
         try:
-            records = compute(fetch_candles(symbol))
-            if len(records) < 2:
-                raise RuntimeError('Insufficient computed records')
-            latest = records[-1]
-            previous = checkpoints.get(symbol)
-            LOG.info('%s candle=%s direction=%s cluster=%s signal=%s', symbol, latest['time'], latest['direction'], latest['cluster'], latest['signal'])
-            if previous is None:
-                LOG.info('%s first observation; initializing without historical alerts', symbol)
-            else:
-                previous = int(previous)
-                if previous > latest['time']:
-                    raise RuntimeError('Checkpoint newer than exchange candle')
-                if previous < records[0]['time']:
-                    raise RuntimeError('Checkpoint older than available candle history; no silent skipping')
-                for record in records:
-                    if record['time'] > previous and record['signal']:
-                        send_telegram(symbol, record)
-                        LOG.info('%s Telegram %s sent for %s', symbol, record['signal'], record['time'])
-            checkpoints[symbol] = latest['time']
-            save_state(state)  # keep progress across symbols; reruns are idempotent per checkpoint
+            candles = fetch_candles(symbol)
         except Exception as exc:
-            LOG.exception('Failed market %s: %s', symbol, exc)
-            errors.append(symbol)
-    LOG.info('Processed %d markets; failures=%d', len(symbols), len(errors))
+            LOG.exception('Failed candles %s: %s', symbol, exc)
+            errors.append(f'{symbol}/candles')
+            continue
+
+        # Independent error handling and state per indicator.
+        for indicator, calculator, checkpoints in (
+            ('Adaptive SuperTrend', compute, st_checkpoints),
+            ('Range Filter', compute_range_filter, rf_checkpoints),
+        ):
+            try:
+                records = calculator(candles)
+                process_indicator(symbol, records, checkpoints, indicator, state)
+            except Exception as exc:
+                LOG.exception('Failed %s %s: %s', symbol, indicator, exc)
+                errors.append(f'{symbol}/{indicator}')
+    LOG.info('Processed %d markets, two indicators; failures=%d', len(symbols), len(errors))
     if errors:
         raise RuntimeError('Markets failed (check logs): ' + ', '.join(errors))
 
