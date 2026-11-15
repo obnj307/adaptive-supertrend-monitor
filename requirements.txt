@@ -1,2 +1,1 @@
-
-# Keine externen Python-Pakete erforderlich
+# Python standard library only
