@@ -1,1 +1,2 @@
 
+# Keine externen Python-Pakete erforderlich
